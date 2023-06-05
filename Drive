@@ -1,0 +1,308 @@
+local seat = script.Value.Value
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Events = ReplicatedStorage.Events
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local chassis = seat.Parent
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local Packet = require(seat.Parent:FindFirstChild(chassis.Name.."Packet"))(chassis)
+local SteerIK = require(ReplicatedStorage.Game.PlayerIK)
+local RunService = game:GetService("RunService")
+local controllingCamera = false
+local cc = workspace.CurrentCamera
+local vec =  seat.position + seat.CFrame.LookVector
+local current = Vector3.new(vec.X, (cc.CFrame.LookVector + seat.Position).Y - 0.1, vec.Z)
+local insideView = false
+local engine = chassis.Engine
+engine.Sound.Volume = 1
+
+Events.Sit:FireServer(seat)
+SteerIK.init(chassis)
+player.Character.Humanoid.Sit = true
+player.PlayerGui.Speedometer.SpeedometerMain.Enabled = true
+player.PlayerGui.Speedometer.Speedometer.Visible = true
+
+--Others
+
+local thrustFR = chassis.ThrustFR.BodyThrust
+local thrustFL = chassis.ThrustFL.BodyThrust
+local thrustRR = chassis.ThrustRR.BodyThrust
+local thrustRL = chassis.ThrustRL.BodyThrust
+
+local inputMap = {}
+inputMap[Enum.KeyCode.W] = 1
+inputMap[Enum.KeyCode.A] = 2
+inputMap[Enum.KeyCode.S] = 3
+inputMap[Enum.KeyCode.D] = 4
+
+local inputs = {}
+inputs[1] = 0
+inputs[2] = 0
+inputs[3] = 0
+inputs[4] = 0
+
+local function inputBegan(input)
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		if input.KeyCode == Enum.KeyCode.W or input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.S or input.KeyCode == Enum.KeyCode.D then
+			inputs[inputMap[input.KeyCode]] = 1
+		end
+		if input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.D then
+			Events.Steer:FireServer(chassis, inputs[2] - inputs[4])
+		end
+	end
+end
+
+local function inputEnded(input)
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		if input.KeyCode == Enum.KeyCode.W or input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.S or input.KeyCode == Enum.KeyCode.D then
+			inputs[inputMap[input.KeyCode]] = 0
+		end
+		if input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.D then
+			Events.Steer:FireServer(chassis, inputs[2] - inputs[4])
+		end
+	end
+end
+
+local engineRPS = 0
+local forward = inputs[1] - inputs[3]
+local steering = inputs[2] - inputs[4]
+local function run(dt)
+	forward = inputs[1] - inputs[3]
+	steering = inputs[2] - inputs[4]
+	local driveThruster = engine.BodyThrust
+	local spin = engine.BodyAngularVelocity
+	local headingDirection = Vector3.new(0, 0, -1)
+	local frictionThrust = engine.FrictionThrust
+	local driftVelocity
+	if engine.Velocity.Magnitude > 0.1 then
+		driftVelocity = (engine.Velocity):Dot(engine.CFrame.RightVector) * Vector3.new(1, 0, 0)
+	else
+		driftVelocity = Vector3.new(0, 0, 0)
+	end
+	local Traction = Packet.Traction
+	local turnSpeed = Packet.TurnSpeed
+	local placeHolder = math.tanh(math.abs(engine.Velocity.Magnitude) / 50)
+	local moveDirection
+	if  engine.Velocity.Magnitude > 0 then
+		moveDirection = engine.Velocity:Dot(engine.CFrame.LookVector) / math.abs(engine.Velocity:Dot(engine.CFrame.LookVector))
+	else
+		moveDirection = 1
+	end
+	local wheelCircumference = 2.9 * math.pi
+	local gears = Packet.Gears
+	local currentGear = Packet.Gear
+	local gearRatio = Packet.Gears[currentGear]
+	local friction = Packet.Friction
+	local wheelRPM = engine.Velocity.Magnitude / wheelCircumference * 60 * moveDirection
+	local engineRPM = (wheelRPM / Packet.GearRatios[currentGear]) * Packet.GearChangeSpeed
+	local slowness = Packet.Slowness
+	
+	if engineRPM > 6000 and currentGear < 6 then
+		Packet.Gear = currentGear + 1
+	elseif engineRPM < 3500 and currentGear > 1 then
+		Packet.Gear = currentGear - 1
+	end
+	local soundMath = math.abs(engineRPM) / 7000 + 0.3
+--	engine.Sound.PlaybackSpeed = math.abs(engineRPM) / 7000 + 0.3
+	Events.Update:FireServer(soundMath)
+	
+	local camGoal =  70 + math.abs(engineRPM) / 400
+	local currentFOV = workspace.CurrentCamera.FieldOfView
+	workspace.CurrentCamera.FieldOfView = currentFOV + (camGoal - currentFOV) * dt * 15
+	
+	local carHeight = Packet.CarHeight
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {chassis}
+	local ray = workspace:Raycast(engine.Position, -carHeight * engine.CFrame.UpVector, params)
+	local boostAmount = Packet.Boost
+	if ray then
+		spin.MaxTorque = Vector3.new(0, 999999995904, 0)
+		local ForwardBackward
+		if forward > 0 then
+			ForwardBackward = 1
+		else
+			ForwardBackward = 80
+		end
+		local engvelcf = engine.CFrame:VectorToObjectSpace(-engine.Velocity)
+		local pt1 = Packet.C1 * engvelcf * engvelcf.Magnitude * Vector3.new(0, 0, ForwardBackward)
+		local pt2 = Packet.C2 * engvelcf * Vector3.new(0, 0, Packet.CV2)
+		local pt3 = gearRatio * forward * Packet.C3 * Vector3.new(0, 0, Packet.CV3) * (Packet.Speed + Packet.EngineLevel)
+		driveThruster.Force = pt1 + pt2 + pt3
+		frictionThrust.Force = - Traction * driftVelocity
+		spin.AngularVelocity = Vector3.new(0, steering * turnSpeed * placeHolder * moveDirection, 0)
+	else
+		driveThruster.Force = Vector3.new(0, 0, 0)
+		frictionThrust.Force = engine.Velocity
+		spin.MaxTorque = Vector3.new(1000000, 999999995904, 1000000)
+	end
+
+	Packet.Traction = Packet.DefaultTraction
+		
+	if controllingCamera == false and insideView == false then
+		current = seat.Position + cc.CFrame.LookVector
+		local zoom = (cc.CFrame.Position - cc.Focus.Position).Magnitude / 6
+		local headpos = player.Character.Head.Position - Vector3.new(0, 0.2, 0)
+		local enginepos = seat.Parent.Engine.Position
+		local cam = seat.Parent.Camera
+		cc.CameraSubject = cam
+		local vec =  seat.position + seat.CFrame.LookVector
+		local goal = Vector3.new(vec.X, (cc.CFrame.LookVector + seat.Position).Y - 0.1, vec.Z)
+		local difference = goal - current
+	elseif insideView == true then
+		cc.CFrame = CFrame.lookAt(seat.Parent.InteriorCamera.Position, seat.Parent.InteriorCamera.Position + seat.CFrame.LookVector)
+	elseif controllingCamera == true and insideView == false then
+		local cam = seat.Parent.Camera
+		local zoom = (cc.CFrame.Position - cc.Focus.Position).Magnitude / 6
+		local headpos = player.Character.Head.Position - Vector3.new(0, 0.2, 0)
+		local enginepos = seat.Parent.Engine.Position
+		cc.CameraSubject = cam
+	end
+end
+
+local function insideCam(action, state)
+	if action == "insideCam" and state == Enum.UserInputState.Begin then
+		if insideView == true and seat.Parent:FindFirstChild("InteriorCamera") then
+			insideView = false
+			player.CameraMode = Enum.CameraMode.Classic
+			cc.CameraType = Enum.CameraType.Custom
+			player.CameraMinZoomDistance = 25
+			player.CameraMinZoomDistance = 0
+			for i, child in player.Character:GetDescendants() do
+				if (child:IsA("Part") or child:IsA("MeshPart") or child:IsA("Decal")) and child.Name ~= "HumanoidRootPart" and child.Name ~= "RightHand" and child.Name ~= "RightUpperArm" and child.Name ~= "RightLowerArm" and child.Name ~= "LeftHand" and child.Name ~= "LeftUpperArm" and child.Name ~= "LeftLowerArm" then
+					child.LocalTransparencyModifier = 0
+				end
+			end
+		elseif insideView == false and seat.Parent:FindFirstChild("InteriorCamera") then
+			insideView = true
+			cc.CameraSubject = seat.Parent.InteriorCamera
+			cc.CameraType = Enum.CameraType.Scriptable
+			for i, child in player.Character:GetDescendants() do
+				if (child:IsA("Part") or child:IsA("MeshPart") or child:IsA("Decal")) and child.Name ~= "HumanoidRootPart" and child.Name ~= "RightHand" and child.Name ~= "RightUpperArm" and child.Name ~= "RightLowerArm" and child.Name ~= "LeftHand" and child.Name ~= "LeftUpperArm" and child.Name ~= "LeftLowerArm" then
+					child.LocalTransparencyModifier = 1
+				end
+			end
+		end
+	end
+end
+
+local function rcb(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		controllingCamera = true
+	end
+end
+
+local function rce(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		controllingCamera = false
+	end
+end
+local goal = 0
+local function sus(tickTime, dt)
+	if steering > 0 then
+		goal = 35
+	elseif steering == 0 then
+		goal = 0
+	elseif steering < 0 then
+		goal = -35
+	end
+	local const = Packet.SpringConsts
+	local length = Packet.Height
+	local MaxLength = Packet.Height + 1
+	local rpar = RaycastParams.new()
+	rpar.FilterDescendantsInstances = {chassis}
+	local damping = Packet.Damping
+
+	for i, thrust in chassis:GetChildren() do
+		if thrust.Name == "ThrustFL" or thrust.Name == "ThrustFR" or thrust.Name == "ThrustRL" or thrust.Name == "ThrustRR" then
+			local ray = workspace:Raycast(thrust.Position, -MaxLength * thrust.CFrame.UpVector, rpar)
+
+			if ray then
+				local thrustVel = math.clamp(thrust.Velocity.Y, 0, 3)
+				local distance = (ray.Position - thrust.CFrame.Position):Dot((Vector3.new(0, -1, 0)))
+				local f = math.clamp(math.abs(length - distance) * const - math.abs(thrustVel) * damping, 0, 1000000)
+				--thrust.BodyThrust.Force = Vector3.new(0, f, 0)
+				local mag = thrust.CFrame.UpVector:Dot(Vector3.new(0, 1, 0))
+				thrust.BodyThrust.Force = thrust.CFrame:VectorToObjectSpace(Vector3.new(0, 1, 0)) * f * mag
+				local wheelRad = chassis.WheelBackLeft.Wheel.Size.Y / 2
+				--local goalPos = (ray.Position - thrust.Position) + wheelRad * thrust.CFrame.UpVector
+				local goalPos = (ray.Position - thrust.Position).Magnitude * Vector3.new(0, -1, 0) - wheelRad * Vector3.new(0, -1, 0)
+				local currentPos = thrust.Attachment.Position
+				local boingSpeed = Packet.BoingSpeed
+				thrust.Attachment.Position = currentPos + (goalPos - currentPos) * dt * boingSpeed
+				
+				local wheelCircumference = chassis.WheelBackLeft.Wheel.Size.Y * math.pi
+				--local lookVector = thrust.Attachment.CFrame.RightVector
+				local rotation = Packet.WheelRotations[thrust.Name]
+				local cf = thrust.Attachment.CFrame
+				local directionalVel = -engine.AssemblyLinearVelocity:Dot(engine.CFrame.LookVector)
+				local rps = directionalVel / wheelCircumference
+				rotation = ((rps * dt) + rotation) % 1
+				--local angles = lookVector * rotation
+				local angles = (rotation) * 360
+				--thrust.Attachment.CFrame = cf * CFrame.Angles(angles.X, angles.Y, angles.Z)
+				Packet.WheelRotations[thrust.Name] = rotation
+				local upVector = CFrame.Angles(angles, 0, 90) * Vector3.new(0, goal, 0)
+				thrust.Attachment.Rotation = Vector3.new(angles, 0, 90)
+				
+				if thrust.Name == "ThrustFL" or thrust.Name == "ThrustFR" then
+					local realGoal = -goal - engine.CFrame.Rotation.Y
+					local WheelTurnSpeed = Packet.WheelSteerSpeed
+					local rtY = thrust.engine.Rotation.Y
+					thrust.engine.Rotation = Vector3.new(0, rtY + (realGoal - rtY) * dt * WheelTurnSpeed, 0)
+				end
+			else
+				if thrust.Name == "ThrustFL" or thrust.Name == "ThrustFR" then
+					local realGoal = -goal - engine.CFrame.Rotation.Y
+					local WheelTurnSpeed = Packet.WheelSteerSpeed
+					local rtY = thrust.engine.Rotation.Y
+					thrust.engine.Rotation = Vector3.new(0, rtY + (realGoal - rtY) * dt * WheelTurnSpeed, 0)
+				end
+				thrust.BodyThrust.Force = Vector3.new(0, 0, 0)
+				thrust.Attachment.Position = Vector3.new(0, -2, 0)
+				
+			end
+		end
+	end
+end
+
+local function exit()
+	SteerIK.BreakArms()
+	local driveThruster = engine.BodyThrust
+	local spin = engine.BodyAngularVelocity
+	local frictionThrust = engine.FrictionThrust
+	player.PlayerGui.Speedometer.Speedometer.Visible = false
+	player.PlayerGui.Speedometer.SpeedometerMain.Enabled = false
+	Packet.Traction = Packet.DefaultTraction
+	
+	driveThruster.Force = Vector3.new(0, 0, 0)
+	frictionThrust.Force = Vector3.new(0, 0, 0)
+	spin.AngularVelocity = Vector3.new(0, 0, 0)
+	ContextActionService:UnbindAction("exit")
+	ContextActionService:UnbindAction("insideCam")
+	ContextActionService:UnbindAction("flip")
+	ContextActionService:UnbindAction("boost")
+	workspace.CurrentCamera.CameraSubject = player.Character.Humanoid
+
+	Events.Unsit:FireServer(seat)
+	engine.Sound.Volume = 0
+	script:Destroy()
+end
+
+local function flip(action, state)
+	if action == "flip" and state == Enum.UserInputState.Begin then
+		chassis.Engine.BodyGyro.MaxTorque = Vector3.new(100000, 0, 100000)
+		wait(2)
+		chassis.Engine.BodyGyro.MaxTorque = Vector3.new(0, 0, 0)
+	end
+end
+
+UserInputService.InputBegan:Connect(inputBegan)
+UserInputService.InputEnded:Connect(inputEnded)
+RunService.Heartbeat:Connect(run)
+ContextActionService:BindAction("insideCam", insideCam, true, Enum.KeyCode.C)
+UserInputService.InputBegan:Connect(rcb)
+UserInputService.InputEnded:Connect(rce)
+RunService.Stepped:Connect(sus)
+ContextActionService:BindAction("exit", exit, true, Enum.KeyCode.Space)
+ContextActionService:BindAction("flip", flip, true, Enum.KeyCode.V)
